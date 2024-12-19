@@ -1,6 +1,7 @@
 package signaler
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/sha1"
 	"encoding/base64"
@@ -12,10 +13,13 @@ import (
 	"strings"
 	"time"
 
+	"github.com/flutter-webrtc/flutter-webrtc-server/pkg/audio_stream"
 	"github.com/flutter-webrtc/flutter-webrtc-server/pkg/logger"
+	"github.com/flutter-webrtc/flutter-webrtc-server/pkg/tts"
 	"github.com/flutter-webrtc/flutter-webrtc-server/pkg/turn"
 	"github.com/flutter-webrtc/flutter-webrtc-server/pkg/util"
 	"github.com/flutter-webrtc/flutter-webrtc-server/pkg/websocket"
+	"github.com/pion/webrtc/v3"
 )
 
 const (
@@ -45,18 +49,27 @@ type Session struct {
 type Method string
 
 const (
-	New       Method = "new"
-	Bye       Method = "bye"
-	Offer     Method = "offer"
-	Answer    Method = "answer"
-	Candidate Method = "candidate"
-	Leave     Method = "leave"
-	Keepalive Method = "keepalive"
+	New        Method = "new"
+	Bye        Method = "bye"
+	Offer      Method = "offer"
+	Answer     Method = "answer"
+	Candidate  Method = "candidate"
+	Leave      Method = "leave"
+	Keepalive  Method = "keepalive"
+	TTSRequest Method = "tts_request"
+	TTSStart   Method = "tts_start"
+	TTSStop    Method = "tts_stop"
 )
 
 type Request struct {
 	Type Method      `json:"type"`
 	Data interface{} `json:"data"`
+}
+
+type TTSRequestData struct {
+	Text  string `json:"text"`
+	Voice string `json:"voice"`
+	Lang  string `json:"lang"`
 }
 
 type PeerInfo struct {
@@ -82,21 +95,25 @@ type Error struct {
 }
 
 type Signaler struct {
-	peers     map[string]Peer
-	sessions  map[string]Session
-	turn      *turn.TurnServer
-	expresMap *util.ExpiredMap
+	peers        map[string]Peer
+	sessions     map[string]Session
+	turn         *turn.TurnServer
+	expresMap    *util.ExpiredMap
+	ttsService   *tts.TTSService
+	audioManager *audio_stream.AudioStreamManager
 }
 
-func NewSignaler(turn *turn.TurnServer) *Signaler {
-	var signaler = &Signaler{
-		peers:     make(map[string]Peer),
-		sessions:  make(map[string]Session),
-		turn:      turn,
-		expresMap: util.NewExpiredMap(),
+func NewSignaler(turn *turn.TurnServer, ttsService *tts.TTSService) *Signaler {
+	s := &Signaler{
+		peers:        make(map[string]Peer),
+		sessions:     make(map[string]Session),
+		turn:         turn,
+		expresMap:    util.NewExpiredMap(),
+		ttsService:   ttsService,
+		audioManager: audio_stream.NewAudioStreamManager(ttsService),
 	}
-	signaler.turn.AuthHandler = signaler.authHandler
-	return signaler
+	s.turn.AuthHandler = s.authHandler
+	return s
 }
 
 func (s Signaler) authHandler(username string, realm string, srcAddr net.Addr) (string, bool) {
@@ -183,7 +200,7 @@ func (s *Signaler) HandleTurnServerCredentials(writer http.ResponseWriter, reque
 func (s *Signaler) Send(conn *websocket.WebSocketConn, m interface{}) error {
 	data, err := json.Marshal(m)
 	if err != nil {
-		logger.Errorf(err.Error())
+		logger.Errorf("%s", err.Error())
 		return err
 	}
 	return conn.Send(string(data))
@@ -305,6 +322,52 @@ func (s *Signaler) HandleNewWebSocket(conn *websocket.WebSocketConn, request *ht
 
 		case Keepalive:
 			s.Send(conn, request)
+		case TTSRequest:
+			var ttsData TTSRequestData
+			if err := json.Unmarshal(body, &ttsData); err != nil {
+				logger.Errorf("Failed to unmarshal TTS request: %v", err)
+				return
+			} // Initialize WebRTC for audio streaming if needed
+			if err := s.audioManager.InitializePeerConnection(webrtc.Configuration{
+				ICEServers: []webrtc.ICEServer{
+					{
+						URLs: []string{"stun:stun.l.google.com:19302"},
+					},
+				},
+			}); err != nil {
+				logger.Errorf("Failed to initialize peer connection: %v", err)
+				return
+			}
+
+			// Start TTS streaming
+			ctx, cancel := context.WithCancel(context.Background())
+			go func() {
+				defer cancel()
+				if err := s.audioManager.StreamTTSAudio(ctx, ttsData.Text, ttsData.Voice, ttsData.Lang); err != nil {
+					logger.Errorf("TTS streaming error: %v", err)
+					s.Send(conn, Request{
+						Type: "error",
+						Data: Error{
+							Request: string(TTSRequest),
+							Reason:  fmt.Sprintf("TTS streaming failed: %v", err),
+						},
+					})
+				}
+			}()
+
+			// Send success response
+			s.Send(conn, Request{
+				Type: TTSStart,
+				Data: map[string]interface{}{
+					"status": "streaming",
+				},
+			})
+
+		case TTSStop:
+			// Stop TTS streaming
+			if err := s.audioManager.Close(); err != nil {
+				logger.Errorf("Failed to stop TTS streaming: %v", err)
+			}
 		default:
 			logger.Warnf("Unkown request %v", request)
 		}
